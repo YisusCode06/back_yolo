@@ -1,4 +1,5 @@
-from flask import Flask, request, jsonify
+from flask import Flask, jsonify
+from flask_socketio import SocketIO, emit
 from ultralytics import YOLO
 import cv2
 import numpy as np
@@ -7,33 +8,34 @@ import math
 from flask_cors import CORS
 
 app = Flask(__name__)
-CORS(app)  # Habilitar CORS para permitir solicitudes entre frontend y backend
+CORS(app)  # Permitir CORS para solicitudes entre frontend y backend
+socketio = SocketIO(app, cors_allowed_origins="*")  # Configurar SocketIO con CORS habilitado
 
-# Cargar el modelo YOLO en la GPU si está disponible
+# Cargar el modelo YOLO
 model = YOLO("./best.pt")
 
 # Definir las clases según tu archivo data.yaml
 classNames = ['Mal estado', 'Apto para chifles', 'No apto para chifles']
 
-# Ruta para procesar las imágenes recibidas desde el frontend
-@app.route('/process_image', methods=['POST'])
-def process_image():
+# Evento para procesar imágenes recibidas desde el frontend
+@socketio.on('process_image')
+def handle_process_image(data):
     try:
-        # Obtener los datos de la imagen desde el frontend
-        file = request.files['image'].read()
-        npimg = np.frombuffer(file, np.uint8)
+        # El cliente envía la imagen en formato base64
+        image_data = data['image']
+        npimg = np.frombuffer(base64.b64decode(image_data), np.uint8)
         img = cv2.imdecode(npimg, cv2.IMREAD_COLOR)
 
         # Reducir la resolución de la imagen para acelerar el procesamiento
-        target_size = (640, 480)  # Ajustar el tamaño de la imagen según lo que usabas en la cámara
+        target_size = (640, 480)
         img_resized = cv2.resize(img, target_size)
 
         # Detección con YOLO
-        results = model(img_resized, stream=True)  # Ajustar el umbral de confianza si es necesario
+        results = model(img_resized, stream=True)
 
         # Lista para almacenar los contornos de las detecciones
         all_contours = []
-        banana_counts = {name: 0 for name in classNames}  # Inicializar el contador de plátanos
+        banana_counts = {name: 0 for name in classNames}
 
         # Procesar los resultados de YOLO
         for r in results:
@@ -45,14 +47,14 @@ def process_image():
 
                 if cls < len(classNames):
                     class_name = classNames[cls]
-                    banana_counts[class_name] += 1  # Contar el plátano por su estado
+                    banana_counts[class_name] += 1
                     color = (0, 0, 255) if class_name == "Mal estado" else (0, 255, 0) if class_name == "Apto para chifles" else (0, 255, 255)
                     cv2.rectangle(img_resized, (x1, y1), (x2, y2), color, 3)
                     cv2.putText(img_resized, f'{class_name} {confidence}', (x1, y1 - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.6, color, 2)
 
                 # Si el modelo devuelve máscaras, extraer los contornos
                 if hasattr(r, 'masks') and r.masks is not None:
-                    masks = r.masks.data.cpu().numpy()  # Convertir las máscaras a numpy
+                    masks = r.masks.data.cpu().numpy()
 
                     for mask in masks:
                         mask_resized = cv2.resize(mask, (img_resized.shape[1], img_resized.shape[0]))
@@ -66,7 +68,6 @@ def process_image():
 
                         # Almacenar los contornos encontrados
                         for contour in contours:
-                            # Simplificar los contornos
                             epsilon = 0.01 * cv2.arcLength(contour, True)
                             approx_contour = cv2.approxPolyDP(contour, epsilon, True)
                             contour_points = approx_contour[:, 0, :].tolist()
@@ -76,45 +77,46 @@ def process_image():
         _, buffer = cv2.imencode('.jpg', img_resized)
         img_str = base64.b64encode(buffer).decode('utf-8')
 
-        return jsonify({'image': img_str, 'contours': all_contours, 'banana_counts': banana_counts})
+        # Emitir la imagen procesada y los resultados al frontend
+        emit('image_processed', {'image': img_str, 'contours': all_contours, 'banana_counts': banana_counts})
 
     except Exception as e:
         print(f"Error procesando la imagen: {e}")
-        return jsonify({'error': str(e)})
+        emit('error', {'error': str(e)})
 
-# Nueva ruta para contar los plátanos
-@app.route('/count_bananas', methods=['POST'])
-def count_bananas():
+# Evento para contar los plátanos sin procesar imágenes
+@socketio.on('count_bananas')
+def handle_count_bananas(data):
     try:
-        # Obtener los datos de la imagen desde el frontend
-        file = request.files['image'].read()
-        npimg = np.frombuffer(file, np.uint8)
+        # El cliente envía la imagen en formato base64
+        image_data = data['image']
+        npimg = np.frombuffer(base64.b64decode(image_data), np.uint8)
         img = cv2.imdecode(npimg, cv2.IMREAD_COLOR)
 
-        # Reducir la resolución de la imagen para acelerar el procesamiento
+        # Reducir la resolución de la imagen
         target_size = (640, 480)
         img_resized = cv2.resize(img, target_size)
 
         # Detección con YOLO
         results = model(img_resized, stream=True)
 
-        banana_counts = {name: 0 for name in classNames}  # Inicializar el contador de plátanos
+        banana_counts = {name: 0 for name in classNames}
 
         # Procesar los resultados de YOLO
         for r in results:
             boxes = r.boxes
             for box in boxes:
                 cls = int(box.cls[0])
-
                 if cls < len(classNames):
                     class_name = classNames[cls]
-                    banana_counts[class_name] += 1  # Contar el plátano por su estado
+                    banana_counts[class_name] += 1
 
-        return jsonify({'banana_counts': banana_counts})
+        # Emitir el conteo de plátanos al frontend
+        emit('banana_counted', {'banana_counts': banana_counts})
 
     except Exception as e:
         print(f"Error contando plátanos: {e}")
-        return jsonify({'error': str(e)})
+        emit('error', {'error': str(e)})
 
 if __name__ == "__main__":
-    app.run(debug=True)
+    socketio.run(app, debug=True, host='0.0.0.0')
